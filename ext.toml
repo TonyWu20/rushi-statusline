@@ -1,0 +1,17 @@
+# The reference statusline extension, Rust port
+# (ui-extension-plan stage 4). The bash reference is
+# ui_extensions/statusline/. The row is the same powerline footer:
+# rounded pill segments with Nerd Font glyphs (U+E0B6 caps, U+E0B4
+# arrows and end cap), each span carrying its own hex colors.
+#
+# Build: `cargo build` in this directory (a standalone cargo
+# package, not a member of the root workspace). Put
+# ./target/debug on `PATH` so the host can resolve the
+# `statusline-ext` command.
+
+[ext]
+command = "target/release/statusline-ext"
+caps = ["status"]
+kinds = ["assistant_message"]
+tick_ms = 1000
+protocol_v = 1

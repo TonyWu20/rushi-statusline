@@ -1,0 +1,22 @@
+# The reference `statusline` extension, Rust port
+# (ui-extension-plan stage 4). A standalone cargo package, not a
+# member of the root workspace.
+#
+# Build: `cargo build` here. The binary lands in
+# ./target/debug/statusline-ext; put that directory on `PATH` so
+# the TUI host can resolve the command from ext.toml.
+
+[package]
+name = "statusline-ext"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[[bin]]
+name = "statusline-ext"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
