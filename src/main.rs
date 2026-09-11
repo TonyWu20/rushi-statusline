@@ -24,6 +24,15 @@
 //!   joins the totals; the context fullness metric stays on the
 //!   last assistant_message input (docs/auto-compact-plan.md
 //!   section 4.6)
+//! - token speed gauges: P (prefill) and G (generation) tokens/s,
+//!   averaged over the last 5 LLM calls. P divides input tokens by
+//!   the inter-event duration; G divides output tokens by the same
+//!   duration. Both hide until the second assistant_message arrives
+//!   (the first call has no elapsed-time baseline). The protocol
+//!   does not expose first-token timing, so the duration is the
+//!   wall-clock gap between consecutive assistant_message events,
+//!   not the precise prefill-vs-generation split the in-process
+//!   reference achieves
 //! - the numbers shorten to k/M/B, the reference fmtNum rule, with
 //!   a trailing .0 dropped (5500 -> 5.5k, 5000 -> 5k, 1.2M)
 //!   the host re-sends every usage-bearing event of the listed
@@ -35,7 +44,9 @@
 //!   window is the active model's context_tokens from $CONFIG; the
 //!   metric is the last usage event's input_tokens, not the
 //!   cumulative totals. The section hides until both are known. Both
-//!   numbers shorten with the same k/M/B rule.
+//!   numbers shorten with the same k/M/B rule. The ctx percentage
+//!   color-shifts with usage: default text under 70%, yellow
+//!   70-90%, red above 90%
 //!
 //! The footer does NOT dump the ext_status values the tick payload
 //! carries: shared UI state (model_thinking, loop_phase, other
@@ -57,7 +68,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// The git cache TTL: a tick never spawns git more than once per
 /// interval (the design's tick-cost note).
@@ -67,6 +78,8 @@ const GIT_TTL: Duration = Duration::from_secs(3);
 /// hard divider joins the pills and closes the line.
 const SEP_L: &str = "\u{E0B6}";
 const SEP_R: &str = "\u{E0B4}";
+// The Git logo glyph (Nerd Font), replacing the old `git` word prefix.
+const GIT_GLYPH: &str = "\u{E725}";
 // Catppuccin Macchiato, the starship-statusline reference palette.
 // The backgrounds match the reference: dark base/surface pills, one
 // light mauve pill for the model.
@@ -76,9 +89,23 @@ const MODEL_BG: &str = "c6a0f6"; // mauve
 const STATS_BG: &str = "494d64"; // surface1
 const TXT: &str = "cad3f5"; // text, on dark backgrounds
 const TXT_DARK: &str = "1e2030"; // mantle, on light backgrounds
+                                 // Context-usage color thresholds (Catppuccin Macchiato).
+const CTX_WARN: &str = "eed49f"; // yellow, 70-90%
+const CTX_DANGER: &str = "ee99a0"; // red, above 90%
+
+/// Number of recent calls averaged into the P/G speed gauges.
+const RATE_WINDOW: usize = 5;
 
 /// The shared git state: branch, dirty count, last refresh time.
 type GitCache = (String, u64, Option<Instant>);
+
+/// One completed LLM call's token counts and wall-clock duration.
+#[derive(Clone, Debug)]
+struct RateSample {
+    input: u64,
+    output: u64,
+    duration_ms: u64,
+}
 
 /// The live dir: the config dir, where the TUI and the loop operate
 /// ($CONFIG is exported by the host; unset means the current dir).
@@ -184,15 +211,27 @@ fn span(text: &str, fg: &str, bg: &str, bold: bool) -> Value {
 /// The span list of one pill row from the segments, in display
 /// order. The row is [cap, body, arrow, cap, body, ..., endcap];
 /// the cap and arrow colors follow the reference.
-fn row_spans(segs: &[Seg]) -> Vec<Value> {
+///
+/// When `stats_ctx` is `Some((text, fg))`, an extra colored span is
+/// appended inside the last pill for the context-fullness section,
+/// color-coded by usage level.
+fn row_spans(segs: &[Seg], stats_ctx: Option<(&str, &str)>) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     let mut prev_bg: &str = "";
-    for s in segs {
+    for (i, s) in segs.iter().enumerate() {
         if !prev_bg.is_empty() {
             out.push(span(SEP_R, prev_bg, s.bg, false));
         }
         out.push(span(SEP_L, s.bg, s.bg, false));
         out.push(span(&format!(" {} ", s.text), s.fg, s.bg, true));
+        // The last segment (stats pill) may carry a colored ctx span.
+        if i + 1 == segs.len() {
+            if let Some((ctx_text, ctx_fg)) = stats_ctx {
+                if !ctx_text.is_empty() {
+                    out.push(span(&format!(" {ctx_text}"), ctx_fg, s.bg, true));
+                }
+            }
+        }
         prev_bg = s.bg;
     }
     out.push(span(SEP_R, prev_bg, "", false));
@@ -239,6 +278,35 @@ fn fmt_num(n: u64) -> String {
     }
 }
 
+/// Format a per-second token rate: 210.3k/s, 450/s, 47.2/s.
+fn fmt_rate(tps: f64) -> String {
+    if tps >= 1000.0 {
+        format!("{:.1}k/s", tps / 1000.0)
+    } else if tps >= 100.0 {
+        format!("{}/s", (tps + 0.5) as u64)
+    } else {
+        format!("{:.1}/s", tps)
+    }
+}
+
+/// Build `P:<rate> G:<rate>` from recent calls. Returns "" when no
+/// usable data (fewer than 2 samples or zero tokens).
+fn rate_text(samples: &[RateSample]) -> String {
+    let total_in: u64 = samples.iter().map(|s| s.input).sum();
+    let total_out: u64 = samples.iter().map(|s| s.output).sum();
+    let total_ms: u64 = samples.iter().map(|s| s.duration_ms).sum();
+    let mut parts = Vec::new();
+    if total_ms > 0 && total_in > 0 {
+        let p = total_in as f64 * 1000.0 / total_ms as f64;
+        parts.push(format!("P:{}", fmt_rate(p)));
+    }
+    if total_ms > 0 && total_out > 0 {
+        let g = total_out as f64 * 1000.0 / total_ms as f64;
+        parts.push(format!("G:{}", fmt_rate(g)));
+    }
+    parts.join(" ")
+}
+
 /// The context-fullness section, starship-statusline style:
 /// `ctx <pct>% (<tokens>/<window>)`. Both numbers need to be
 /// known, so the section hides until the last usage event and the
@@ -251,6 +319,27 @@ fn ctx_text(last_in: u64, window: Option<u64>) -> Option<String> {
     let pct10 = last_in.saturating_mul(1000) / w;
     let pct = format!("{}.{}", pct10 / 10, pct10 % 10);
     Some(format!("ctx:{pct}% ({}/{})", fmt_num(last_in), fmt_num(w)))
+}
+
+/// The fg color for the ctx percentage section, keyed on how full
+/// the context window is. Default text under 70%, yellow 70-90%,
+/// red above 90% (matching the starship-statusline reference).
+fn ctx_fg_color(last_in: u64, window: Option<u64>) -> &'static str {
+    let w = match window {
+        Some(w) if w > 0 => w,
+        _ => return TXT,
+    };
+    if last_in == 0 {
+        return TXT;
+    }
+    let pct10 = last_in.saturating_mul(1000) / w;
+    if pct10 > 900 {
+        CTX_DANGER
+    } else if pct10 > 700 {
+        CTX_WARN
+    } else {
+        TXT
+    }
 }
 
 /// The active model's context window from $CONFIG (config.toml):
@@ -303,10 +392,18 @@ fn main() {
     // model reuses the value.
     let mut ctx_model = String::new();
     let mut ctx_window: Option<u64> = None;
+    // Per-call rate tracking: a ring buffer of the last N completed
+    // assistant_message calls. Each sample records the input/output
+    // tokens and the wall-clock duration since the previous call.
+    // The protocol has no first-token event, so the duration is the
+    // inter-event gap, not a precise prefill-vs-gen split.
+    let mut rate_samples: Vec<RateSample> = Vec::new();
+    let mut last_event_time: Option<SystemTime> = None;
     // The git cache starts "fresh": the first tick skips the git
-    // spawn and the row shows git:none; the first TTL refresh lands
-    // about 3 s in, on a background thread. A tick reply never
-    // waits on a slow git (the staleness bound is 3 x tick_ms).
+    // spawn and the row shows the git glyph with `none`; the first
+    // TTL refresh lands about 3 s in, on a background thread. A tick
+    // reply never waits on a slow git (the staleness bound is 3 x
+    // tick_ms).
     let git: Arc<Mutex<GitCache>> = Arc::new(Mutex::new((String::new(), 0, Some(Instant::now()))));
 
     let stdin = std::io::stdin();
@@ -334,23 +431,42 @@ fn main() {
                 let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 if ty == "assistant_message" || ty == "compaction_summary" {
                     if let Some(usage) = ev.get("usage").and_then(|u| u.as_object()) {
-                        in_total += usage
+                        let in_tok = usage
                             .get("input_tokens")
                             .and_then(|x| x.as_u64())
                             .unwrap_or(0);
-                        out_total += usage
+                        let out_tok = usage
                             .get("output_tokens")
                             .and_then(|x| x.as_u64())
                             .unwrap_or(0);
-                        cached_total += usage
+                        let cached = usage
                             .get("cached_tokens")
                             .and_then(|x| x.as_u64())
                             .unwrap_or(0);
+                        in_total += in_tok;
+                        out_total += out_tok;
+                        cached_total += cached;
                         if ty == "assistant_message" {
-                            last_in = usage
-                                .get("input_tokens")
-                                .and_then(|x| x.as_u64())
-                                .unwrap_or(0);
+                            last_in = in_tok;
+                            // Track the inter-event duration for the
+                            // P/G speed gauges. The first call has no
+                            // baseline, so it does not produce a
+                            // sample; the second call onward does.
+                            let now = SystemTime::now();
+                            if let Some(prev) = last_event_time {
+                                if let Ok(elapsed) = now.duration_since(prev) {
+                                    let duration_ms = elapsed.as_millis() as u64;
+                                    rate_samples.push(RateSample {
+                                        input: in_tok,
+                                        output: out_tok,
+                                        duration_ms,
+                                    });
+                                    if rate_samples.len() > RATE_WINDOW {
+                                        rate_samples.remove(0);
+                                    }
+                                }
+                            }
+                            last_event_time = Some(now);
                         }
                     }
                 }
@@ -374,24 +490,29 @@ fn main() {
 
                 // The context window is keyed on the model name from
                 // the tick. The model rarely changes; the re-parse
-                // only fires on a switch.
+                // only fires on a switch. Rates are model-specific,
+                // so a switch also resets the sample window.
                 if model != ctx_model {
                     ctx_window = ctx_window_of(model);
                     ctx_model = model.to_string();
+                    rate_samples.clear();
+                    last_event_time = None;
                 }
                 let git_txt = if branch.is_empty() {
-                    "git:none".to_string()
+                    format!("{GIT_GLYPH} none")
                 } else {
-                    let mut t = format!("git:{branch}");
+                    let mut t = format!("{GIT_GLYPH} {branch}");
                     if dirty > 0 {
                         t.push_str(&format!(" *{dirty}"));
                     }
-                    t.chars().take(24).collect::<String>()
+                    t.chars().take(32).collect::<String>()
                 };
                 // The stats pill: the cumulative totals (k/M/B
                 // shortened), the cached total when the session saw
-                // any, the ctx section when both its inputs are
-                // known.
+                // any, the P/G speed gauges when at least one
+                // inter-event sample exists, and the ctx section
+                // when both its inputs are known. The ctx section
+                // is a separate span with its own fg color.
                 let mut stats = format!(
                     "in:{} out:{} sum:{}",
                     fmt_num(in_total),
@@ -401,14 +522,24 @@ fn main() {
                 if cached_total > 0 {
                     stats.push_str(&format!(" R:{}", fmt_num(cached_total)));
                 }
-                if let Some(c) = ctx_text(last_in, ctx_window) {
-                    stats.push_str(&format!(" {c}"));
+                let rate = rate_text(&rate_samples);
+                if !rate.is_empty() {
+                    stats.push_str(&format!(" {rate}"));
                 }
+                let ctx = ctx_text(last_in, ctx_window);
+                let ctx_fg = ctx_fg_color(last_in, ctx_window);
+                // The stats segment text excludes the ctx portion;
+                // the ctx text is a separate colored span.
+                let stats_seg = Seg {
+                    text: stats,
+                    fg: TXT,
+                    bg: STATS_BG,
+                };
+                // Width calculation must include the ctx text that
+                // will be rendered as a separate span.
+                let ctx_str = ctx.as_deref().unwrap_or("");
+                let stats_width = stats_seg.text.chars().count() + ctx_str.chars().count() + 4;
 
-                // One segment per pill. The head (dir) never drops;
-                // the model and git pills drop in that order on
-                // overflow; the stats pill keeps its space (the
-                // token indicator wins the width fight).
                 let dir_seg = Seg {
                     text: short_dir(&dir),
                     fg: TXT,
@@ -424,30 +555,25 @@ fn main() {
                     fg: TXT_DARK,
                     bg: MODEL_BG,
                 };
-                let stats_seg = Seg {
-                    text: stats,
-                    fg: TXT,
-                    bg: STATS_BG,
-                };
+                let ctx_param: Option<(&str, &str)> = ctx.as_deref().map(|c| (c, ctx_fg));
                 let lines: Vec<Value> = if width >= 100 {
                     // One line: reserve the stats pill and its join
                     // arrow, then fit dir, git, and model into the
                     // rest. The tail-drop order is model first,
                     // then git.
-                    let stats_cols = row_cols(&[stats_seg.clone()]);
-                    let rest_w = width.saturating_sub(stats_cols.saturating_sub(1));
+                    let rest_w = width.saturating_sub(stats_width.saturating_sub(1));
                     let l1 = fit(&[dir_seg.clone(), git_seg.clone(), model_seg], rest_w);
                     let mut row = l1;
-                    row.push(stats_seg);
-                    vec![Value::Array(row_spans(&row))]
+                    row.push(stats_seg.clone());
+                    vec![Value::Array(row_spans(&row, ctx_param))]
                 } else {
                     // Two-line layout: line 1 is dir, git, model;
                     // line 2 is the stats pill alone. Each row fits
                     // the width on its own.
                     let l1 = fit(&[dir_seg.clone(), git_seg.clone(), model_seg], width);
                     vec![
-                        Value::Array(row_spans(&l1)),
-                        Value::Array(row_spans(&[stats_seg])),
+                        Value::Array(row_spans(&l1, None)),
+                        Value::Array(row_spans(&[stats_seg], ctx_param)),
                     ]
                 };
                 let reply = json!({"v": 1, "op": "status", "lines": lines});
