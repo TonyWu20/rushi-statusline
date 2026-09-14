@@ -12,8 +12,9 @@
 //! to right on one row.
 //!
 //! The row shows:
-//! - live dir: the config dir, where the TUI and the loop operate
-//!   ($CONFIG is exported by the host)
+//! - live dir: the host working dir (the tick payload `cwd` field,
+//!   the `RUSHI_CWD` spawn env var, or the $CONFIG dir as a legacy
+//!   fallback for hosts that do not export it)
 //! - git branch + dirty mark, TTL-cached at 3 s so a tick never
 //!   spawns git more than once per 3 s (the design tick-cost note)
 //! - model from the tick payload. The session name and the loop
@@ -107,9 +108,17 @@ struct RateSample {
     duration_ms: u64,
 }
 
-/// The live dir: the config dir, where the TUI and the loop operate
-/// ($CONFIG is exported by the host; unset means the current dir).
+/// The working dir for the dir pill and git refresh. The host
+/// exports RUSHI_CWD (the TUI process working dir). The $CONFIG
+/// parent dir is the legacy fallback for hosts that predate the
+/// env var. An unset or missing parent means the current dir.
+/// The tick payload cwd field overrides both once it arrives.
 fn live_dir() -> String {
+    if let Ok(p) = std::env::var("RUSHI_CWD") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
     match std::env::var("CONFIG") {
         Ok(p) => std::path::Path::new(&p)
             .parent()
@@ -379,7 +388,7 @@ fn ctx_window_of(model: &str) -> Option<u64> {
 }
 
 fn main() {
-    let dir = live_dir();
+    let mut dir = live_dir();
     let mut in_total: u64 = 0;
     let mut out_total: u64 = 0;
     let mut cached_total: u64 = 0;
@@ -472,6 +481,14 @@ fn main() {
                 }
             }
             Some("tick") => {
+                // The host tick carries the working dir. It wins
+                // over the env and config fallbacks captured at
+                // startup.
+                if let Some(cwd) =
+                    v.get("cwd").and_then(|c| c.as_str()).filter(|c| !c.is_empty())
+                {
+                    dir = cwd.to_string();
+                }
                 git_refresh(&dir, &git);
                 let (branch, dirty) = {
                     let c = git.lock().unwrap();
