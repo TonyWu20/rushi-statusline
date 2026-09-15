@@ -20,16 +20,16 @@
 //! - model from the tick payload. The session name and the loop
 //!   state stay in the host's top bar (frame title); the footer
 //!   does not duplicate them
-//! - cumulative usage summed over assistant_message.usage and
-//!   compaction_summary.usage events. The summary call's usage
-//!   joins the totals; the context fullness metric stays on the
-//!   last assistant_message input (docs/auto-compact-plan.md
-//!   section 4.6)
+//! - usage scoped to the active session, summed over
+//!   assistant_message.usage and compaction_summary.usage events.
+//!   The host replays the session's usage events at start and on
+//!   every session switch, so counts reset on switch and rebuild
+//!   from that session's replay
 //! - token speed gauges: P (prefill) and G (generation) tokens/s,
 //!   averaged over the last 5 LLM calls. P divides input tokens by
 //!   the inter-event duration; G divides output tokens by the same
-//!   duration. Both hide until the second assistant_message arrives
-//!   (the first call has no elapsed-time baseline). The protocol
+//!   duration. Both hide until the second assistant_message of the
+//!   session arrives (the first call has no elapsed-time baseline). The protocol
 //!   does not expose first-token timing, so the duration is the
 //!   wall-clock gap between consecutive assistant_message events,
 //!   not the precise prefill-vs-generation split the in-process
@@ -37,8 +37,8 @@
 //! - the numbers shorten to k/M/B, the reference fmtNum rule, with
 //!   a trailing .0 dropped (5500 -> 5.5k, 5000 -> 5k, 1.2M)
 //!   the host re-sends every usage-bearing event of the listed
-//!   kinds at start, so the totals survive a TUI restart from the
-//!   log alone
+//!   kinds at start and on session switch, so totals rebuild from
+//!   the log alone
 //! - context fullness, the number to watch for compaction: the last
 //!   measured request input tokens over the model window, in the
 //!   starship-statusline style (ctx <pct>% (<tokens>/<window>)). The
@@ -389,12 +389,27 @@ fn ctx_window_of(model: &str) -> Option<u64> {
 
 fn main() {
     let mut dir = live_dir();
-    let mut in_total: u64 = 0;
-    let mut out_total: u64 = 0;
-    let mut cached_total: u64 = 0;
+    // Session-scoped usage. The host re-sends the active session's
+    // full usage history on start and on every session switch
+    // (docs/ui-extension.md section 4). The TUI's switch path runs
+    // clear_replies plus send_history. The counters therefore stay
+    // scoped to the active session.
+    //
+    // Events arriving between two ticks commit on the next tick. A
+    // same-session batch is live growth, so add it. A changed or
+    // first-tick session batch is a replay, so replace the total
+    // with it.
+    let mut cur_session: Option<String> = None;
+    let mut total_in: u64 = 0;
+    let mut total_out: u64 = 0;
+    let mut total_cached: u64 = 0;
+    let mut pend_in: u64 = 0;
+    let mut pend_out: u64 = 0;
+    let mut pend_cached: u64 = 0;
     // The last request's measured input tokens. Context fullness
     // rides on this value, not the cumulative totals.
     let mut last_in: u64 = 0;
+    let mut pend_last_in: Option<u64> = None;
     // The context window cache, keyed on the model name. The model
     // name comes from the tick payload; the window is the model's
     // context_tokens in $CONFIG. A model change re-parses; the same
@@ -405,7 +420,8 @@ fn main() {
     // assistant_message calls. Each sample records the input/output
     // tokens and the wall-clock duration since the previous call.
     // The protocol has no first-token event, so the duration is the
-    // inter-event gap, not a precise prefill-vs-gen split.
+    // inter-event gap, not a precise prefill-vs-gen split. Reset on
+    // a session switch, since inter-event gaps cross sessions.
     let mut rate_samples: Vec<RateSample> = Vec::new();
     let mut last_event_time: Option<SystemTime> = None;
     // The git cache starts "fresh": the first tick skips the git
@@ -428,13 +444,15 @@ fn main() {
         };
         match v.get("op").and_then(|o| o.as_str()) {
             Some("event") => {
-                // Cumulative usage: the host re-sends every
-                // usage-bearing message of the listed kinds at
-                // start, so the totals survive a TUI restart from
-                // the log alone. The compaction_summary usage joins
-                // the cumulative totals. It does not move the
-                // context fullness metric: the ctx section reads
-                // the last assistant_message input only
+                // Usage events accumulate into the pending batch, and
+                // the next tick commits it (state note at the top of
+                // main). The host re-sends every usage-bearing event
+                // at start and on each session switch, so totals
+                // survive a restart from the log alone.
+                //
+                // The compaction_summary usage joins the totals. It
+                // does not move the context fullness metric. The ctx
+                // section reads the last assistant_message input only
                 // (docs/auto-compact-plan.md section 4.6).
                 let ev = &v["event"];
                 let ty = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -452,12 +470,16 @@ fn main() {
                             .get("cached_tokens")
                             .and_then(|x| x.as_u64())
                             .unwrap_or(0);
-                        in_total += in_tok;
-                        out_total += out_tok;
-                        cached_total += cached;
+                        pend_in += in_tok;
+                        pend_out += out_tok;
+                        pend_cached += cached;
                         if ty == "assistant_message" {
-                            last_in = in_tok;
-                            // Track the inter-event duration for the
+                            // The ctx metric rides on the last
+                            // assistant_message input of the active
+                            // session. It is committed with the totals
+                            // on the next tick, so a session switch
+                            // cannot leak the previous session's value.
+                            pend_last_in = Some(in_tok);
                             // P/G speed gauges. The first call has no
                             // baseline, so it does not produce a
                             // sample; the second call onward does.
@@ -484,8 +506,10 @@ fn main() {
                 // The host tick carries the working dir. It wins
                 // over the env and config fallbacks captured at
                 // startup.
-                if let Some(cwd) =
-                    v.get("cwd").and_then(|c| c.as_str()).filter(|c| !c.is_empty())
+                if let Some(cwd) = v
+                    .get("cwd")
+                    .and_then(|c| c.as_str())
+                    .filter(|c| !c.is_empty())
                 {
                     dir = cwd.to_string();
                 }
@@ -500,10 +524,48 @@ fn main() {
                     .and_then(|m| m.as_str())
                     .filter(|m| !m.is_empty())
                     .unwrap_or("no-model");
-                // The tick also carries session, loop_running,
-                // thinking, and the ext_status statuses map. The
-                // footer does not consume them: the host top bar
-                // and the input-area border show that state.
+                // The tick also carries loop_running, thinking, and
+                // the ext_status statuses map. The footer does not
+                // consume them. The host top bar and the input-area
+                // border show that state. The session name drives
+                // the usage commit below.
+                let tick_session = v
+                    .get("session")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+                // Commit the pending usage batch. A changed or first
+                // session means the host replayed that session's
+                // usage history, so replace the totals. An
+                // unchanged session means live growth, so add the
+                // batch in.
+                let switched = match (&cur_session, &tick_session) {
+                    (None, Some(_)) => true,
+                    (Some(c), Some(t)) => c != t,
+                    _ => false,
+                };
+                if switched {
+                    total_in = pend_in;
+                    total_out = pend_out;
+                    total_cached = pend_cached;
+                    last_in = pend_last_in.unwrap_or(0);
+                    rate_samples.clear();
+                    last_event_time = None;
+                    cur_session = tick_session.clone();
+                } else {
+                    total_in += pend_in;
+                    total_out += pend_out;
+                    total_cached += pend_cached;
+                    if let Some(v) = pend_last_in {
+                        last_in = v;
+                    }
+                    if let Some(t) = tick_session {
+                        cur_session = Some(t);
+                    }
+                }
+                pend_in = 0;
+                pend_out = 0;
+                pend_cached = 0;
+                pend_last_in = None;
 
                 // The context window is keyed on the model name from
                 // the tick. The model rarely changes; the re-parse
@@ -524,20 +586,20 @@ fn main() {
                     }
                     t.chars().take(32).collect::<String>()
                 };
-                // The stats pill: the cumulative totals (k/M/B
-                // shortened), the cached total when the session saw
-                // any, the P/G speed gauges when at least one
-                // inter-event sample exists, and the ctx section
-                // when both its inputs are known. The ctx section
-                // is a separate span with its own fg color.
+                // The stats pill shows the session totals, shortened
+                // to k/M/B. The cached total shows when the session
+                // saw any. The P/G gauges show when at least one
+                // inter-event sample exists. The ctx section shows
+                // when both its inputs are known. The ctx section is
+                // a separate span with its own fg color.
                 let mut stats = format!(
                     "in:{} out:{} sum:{}",
-                    fmt_num(in_total),
-                    fmt_num(out_total),
-                    fmt_num(in_total + out_total)
+                    fmt_num(total_in),
+                    fmt_num(total_out),
+                    fmt_num(total_in + total_out)
                 );
-                if cached_total > 0 {
-                    stats.push_str(&format!(" R:{}", fmt_num(cached_total)));
+                if total_cached > 0 {
+                    stats.push_str(&format!(" R:{}", fmt_num(total_cached)));
                 }
                 let rate = rate_text(&rate_samples);
                 if !rate.is_empty() {

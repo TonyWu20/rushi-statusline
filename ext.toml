@@ -12,6 +12,8 @@
 [ext]
 command = "target/release/statusline-ext"
 caps = ["status"]
-kinds = ["assistant_message"]
+# Both kinds carry usage. The extension sums them into the
+# session-scoped totals.
+kinds = ["assistant_message", "compaction_summary"]
 tick_ms = 1000
 protocol_v = 1
