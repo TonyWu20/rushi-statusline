@@ -72,6 +72,9 @@
                 cp ${extToml} $out/${extName}/ext.toml
                 cp -rL ${built}/bin/. $out/${extName}/${binDir}/
               '';
+              # meta.rushi.ext (rushi#13): the UI-ext entry dir this
+              # package provides. lib.mkRushi reads it at eval time.
+              meta = { rushi = { ext = extName; }; };
             };
         in
         rec {
