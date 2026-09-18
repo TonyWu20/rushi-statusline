@@ -27,7 +27,7 @@
 
   outputs = { self, nixpkgs, fenix }:
     let
-      supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
+      supportedSystems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       pkgLib = nixpkgs.lib;
 
       buildFor = system:
@@ -37,7 +37,12 @@
             overlays = [ fenix.overlays.default ];
           };
           rustToolchain = fenix.packages.${system}.stable.withComponents [
-            "cargo" "clippy" "rust-src" "rustc" "rustfmt" "rust-analyzer"
+            "cargo"
+            "clippy"
+            "rust-src"
+            "rustc"
+            "rustfmt"
+            "rust-analyzer"
           ];
 
           # Build one standalone cargo crate from a subpath of this flake's
