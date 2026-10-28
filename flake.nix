@@ -100,5 +100,46 @@
       # flake shape: `nix build .` resolves packages.<host>.default, and
       # the consumer reads extFlake.packages.<system>.statusline.
       packages = pkgLib.genAttrs supportedSystems (system: buildFor system);
+      # The rushiExt selection contract (kernel docs
+      # ext-flake-authoring.md section 4.6): this flake's
+      # packages bucketed by meta.rushi. Self-contained: the ext
+      # repo tracks only nixpkgs/fenix, not the kernel, so a
+      # kernel update is never a re-lock here. A consumer
+      # declares this flake as an input and passes it straight to
+      # a rushi builder (no packages.<system>.<name> selection,
+      # no bucket routing).
+      rushiExt = pkgLib.genAttrs supportedSystems (system:
+        let
+          concrete = builtins.removeAttrs (buildFor system) [ "default" ];
+          bucketOf =
+            p:
+            let
+              m = p.meta or { };
+            in
+            if m ? rushi
+            then
+            let
+              r = m.rushi;
+            in
+            if r ? entry then "tools"
+            else if r ? ext then "ui"
+            else if r ? bin then "hooks"
+            else null
+            else null;
+          pick =
+            b:
+            builtins.foldl' (a: l: a ++ l) [ ] (
+              builtins.map (n:
+                if bucketOf concrete.${n} == b
+                then [ concrete.${n} ]
+                else [ ]
+              ) (builtins.attrNames concrete)
+            );
+        in
+        {
+          tools = pick "tools";
+          ui = pick "ui";
+          hooks = pick "hooks";
+        });
     };
 }
